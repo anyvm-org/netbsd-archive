@@ -1,0 +1,209 @@
+name: Sync archived NetBSD images
+
+# Re-hosts NetBSD release media that upstream has moved to
+# archive.netbsd.org as release assets of this repo, so the netbsd-builder
+# CI can download them. archive.netbsd.org itself cannot be the source --
+# see README.md for what it does to automated downloads.
+#
+# Run this once per image set: an archived NetBSD release never changes,
+# so a sync only has to be repeated when a NEW entry is added to the matrix
+# below. Re-running is cheap: every image already on the release is
+# skipped, so only the new matrix entries download anything.
+#
+# The 9.0 / 9.1 / 9.2 evbarm-aarch64 images on v0.0.1 were uploaded by
+# hand before this workflow existed and are deliberately NOT in the matrix:
+# they have no .sha512 sidecar, so the skip check below would not
+# recognise them and would download them again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish the images under"
+        required: true
+        default: "v0.0.1"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Create the release if it does not exist
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        tag="${{ inputs.tag }}"
+        if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "release $tag already exists, reusing it"
+        else
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --notes "Re-hosted NetBSD archived release images (unmodified). See README.md."
+        fi
+
+  sync:
+    # Serialized behind create-release so the parallel uploads below never
+    # race to create the same release.
+    needs: create-release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # path:     upstream path below .../pub/NetBSD-archive/ (and below
+        #           a mirror's NetBSD root -- the trees are identical).
+        # asset:    release asset name. images/ files already carry the
+        #           release and port in their name; gzimg files do not,
+        #           so they get "NetBSD-<rel>-<port>-" prepended, the
+        #           naming already used for the 9.x images on v0.0.1.
+        # checksum: "official" = must match the SHA512 file NetBSD
+        #           publishes next to it (images/SHA512). "gzip" = NetBSD
+        #           publishes NO checksum for evbarm gzimg files (no
+        #           SHA512/MD5 in gzimg/, binary/, the port dir or the
+        #           release root -- checked 2026-10-20), so the file is
+        #           held to the exact upstream size plus `gzip -t`, whose
+        #           CRC32 + length trailer catches a truncated or corrupt
+        #           download.
+        include:
+        - { path: "NetBSD-10.0/images/NetBSD-10.0-amd64.iso",             asset: "NetBSD-10.0-amd64.iso",                    checksum: "official" }
+        - { path: "NetBSD-10.0/images/NetBSD-10.0-sparc64.iso",           asset: "NetBSD-10.0-sparc64.iso",                  checksum: "official" }
+        - { path: "NetBSD-10.0/evbarm-aarch64/binary/gzimg/arm64.img.gz", asset: "NetBSD-10.0-evbarm-aarch64-arm64.img.gz", checksum: "gzip" }
+        - { path: "NetBSD-10.1/images/NetBSD-10.1-amd64.iso",             asset: "NetBSD-10.1-amd64.iso",                    checksum: "official" }
+        - { path: "NetBSD-10.1/images/NetBSD-10.1-sparc64.iso",           asset: "NetBSD-10.1-sparc64.iso",                  checksum: "official" }
+        - { path: "NetBSD-10.1/evbarm-aarch64/binary/gzimg/arm64.img.gz", asset: "NetBSD-10.1-evbarm-aarch64-arm64.img.gz", checksum: "gzip" }
+    name: ${{ matrix.asset }}
+    env:
+      ARCHIVE: https://archive.netbsd.org/pub/NetBSD-archive
+      UA: "anyvm-org/netbsd-archive (+https://github.com/anyvm-org/netbsd-archive)"
+    steps:
+    - name: Skip an image that is already published
+      id: have
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -e
+        file="${{ matrix.asset }}"
+        # An archived release is immutable, so an asset already on the
+        # release is final. Re-fetching it would only cost time, and the
+        # --clobber re-upload below would delete the live asset first, so
+        # a builder downloading it in that window gets a 404. Both files
+        # must be fully uploaded to count: a run that died mid-upload
+        # leaves a non-"uploaded" asset, which is redone.
+        have=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/${{ inputs.tag }}" \
+               --jq '.assets[] | select(.state == "uploaded") | .name')
+        if printf '%s\n' "$have" | grep -qxF "$file" \
+           && printf '%s\n' "$have" | grep -qxF "$file.sha512"; then
+          echo "$file is already published under ${{ inputs.tag }}, skipping"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Download from a mirror
+      if: steps.have.outputs.skip != 'true'
+      run: |
+        set -e
+        path="${{ matrix.path }}"
+        file="${{ matrix.asset }}"
+
+        # The authoritative SIZE comes from archive.netbsd.org itself: it
+        # answers HEAD normally, it only refuses to serve the bytes.
+        expected=$(curl -sSIL -A "$UA" -m 60 "$ARCHIVE/$path" | tr -d '\r' \
+                   | awk 'toupper($1) ~ /^HTTP\// {code = $2; len = ""}
+                          tolower($1) == "content-length:" {len = $2}
+                          END {if (code == "200") print len}')
+        if [ -z "$expected" ]; then
+          echo "archive.netbsd.org gave no size for $path"
+          exit 1
+        fi
+        echo "expected size (archive.netbsd.org HEAD): $expected"
+
+        # The BYTES come from official NetBSD mirrors that still carry the
+        # release in their main tree. No mirror on www.netbsd.org/mirrors/
+        # carries the archive tree itself (checked 2026-10-20), so these
+        # are mirrors whose sync has not dropped the release yet -- which
+        # is exactly why the bytes are re-hosted here rather than fetched
+        # from them on every build. A mirror whose size differs from the
+        # archive's is skipped, never trusted.
+        #
+        # ONE stream, an honest User-Agent, resume on interruption, same
+        # as openeuler-archive: this runs once per image set, so
+        # slow-but-reliable wins.
+        got=""
+        for base in \
+          "https://ftp.uni-erlangen.de/netbsd" \
+          "https://ftp.fau.de/netbsd" \
+          ; do
+          echo "::group::trying $base"
+          size=$(curl -sSIL -A "$UA" -m 60 "$base/$path" | tr -d '\r' \
+                 | awk 'toupper($1) ~ /^HTTP\// {code = $2; len = ""}
+                        tolower($1) == "content-length:" {len = $2}
+                        END {if (code == "200") print len}')
+          echo "mirror size: ${size:-unavailable}"
+          if [ "$size" = "$expected" ]; then
+            rm -f "$file"
+            # --speed-limit aborts a stalled transfer so the next attempt
+            # picks it up again, instead of hanging until the job timeout.
+            for attempt in 1 2 3 4 5 6; do
+              have=$(stat -c%s "$file" 2>/dev/null || echo 0)
+              if [ "$have" = "$expected" ]; then got="$base"; break; fi
+              echo "attempt $attempt: have $have of $expected bytes"
+              curl -fSL -A "$UA" -C - --speed-limit 10240 --speed-time 120 \
+                -o "$file" "$base/$path" || true
+            done
+          fi
+          echo "::endgroup::"
+          if [ -n "$got" ]; then break; fi
+        done
+        if [ -z "$got" ]; then
+          echo "could not download $path from any mirror"
+          exit 1
+        fi
+        echo "downloaded from $got"
+        ls -l "$file"
+
+    - name: Verify
+      if: steps.have.outputs.skip != 'true'
+      run: |
+        set -e
+        path="${{ matrix.path }}"
+        file="${{ matrix.asset }}"
+        name=$(basename "$path")
+        sum=$(sha512sum "$file" | cut -d' ' -f1)
+        case "${{ matrix.checksum }}" in
+          official)
+            # Fail closed: an entry marked "official" whose SHA512 file
+            # cannot be read or does not list the file stops here instead
+            # of falling through to a weaker check.
+            curl -fsSL -A "$UA" -m 60 -o upstream.SHA512 "$ARCHIVE/$(dirname "$path")/SHA512"
+            want=$(awk -v n="($name)" '$1 == "SHA512" && $2 == n && $3 == "=" {print $4}' upstream.SHA512)
+            if [ -z "$want" ]; then
+              echo "no SHA512 for $name in $(dirname "$path")/SHA512"
+              exit 1
+            fi
+            echo "official: $want"
+            echo "computed: $sum"
+            [ "$sum" = "$want" ]
+            ;;
+          gzip)
+            gzip -t "$file"
+            echo "gzip -t OK; sha512 $sum"
+            ;;
+          *)
+            echo "unknown checksum mode '${{ matrix.checksum }}'"
+            exit 1
+            ;;
+        esac
+        # Ship the verified digest next to the image so a consumer can
+        # check it too (sha512sum -c format).
+        printf '%s  %s\n' "$sum" "$file" > "$file.sha512"
+        cat "$file.sha512"
+
+    - name: Upload as a release asset
+      if: steps.have.outputs.skip != 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -e
+        file="${{ matrix.asset }}"
+        gh release upload "${{ inputs.tag }}" "$file" "$file.sha512" \
+          --clobber --repo "$GITHUB_REPOSITORY"
